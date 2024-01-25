@@ -88,6 +88,27 @@ fn main() {
         .opt_str("address")
         .unwrap_or_else(|| "127.0.0.1:12345".to_string());
 
+    // max open file
+    let mut nofile_rlimit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    unsafe {
+        if 0 != libc::getrlimit(libc::RLIMIT_NOFILE, &mut nofile_rlimit) {
+            panic!("getrlimit failed");
+        }
+        if nofile_rlimit.rlim_max < number as u64 + 3 {
+            panic!(
+                "the hard limit of this process is only {}",
+                nofile_rlimit.rlim_max
+            )
+        }
+        nofile_rlimit.rlim_cur = nofile_rlimit.rlim_max.min(number as u64 + 3);
+        if 0 != libc::setrlimit(libc::RLIMIT_NOFILE, &nofile_rlimit) {
+            panic!("setrlimit failed");
+        }
+    }
+
     let (tx, rx) = mpsc::channel();
 
     let stop = Arc::new(AtomicBool::new(false));
