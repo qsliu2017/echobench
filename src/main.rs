@@ -2,7 +2,7 @@ use std::env;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -17,11 +17,6 @@ Usage:
         program = program
     );
     print!("{}", opts.usage(&brief));
-}
-
-struct Count {
-    inb: u64,
-    outb: u64,
 }
 
 fn main() {
@@ -86,7 +81,7 @@ fn main() {
         .unwrap_or(50);
     let address = matches
         .opt_str("address")
-        .unwrap_or_else(|| "127.0.0.1:12345".to_string());
+        .unwrap_or_else(|| "127.0.0.1:8901".to_string());
 
     // max open file
     let mut nofile_rlimit = libc::rlimit {
@@ -109,80 +104,52 @@ fn main() {
         }
     }
 
-    let (tx, rx) = mpsc::channel();
-
     let stop = Arc::new(AtomicBool::new(false));
     let control = Arc::downgrade(&stop);
 
-    for _ in 0..number {
-        let tx = tx.clone();
-        let address = address.clone();
-        let stop = stop.clone();
-        let length = length;
+    let group: Vec<_> = (0..number)
+        .map(|i| (i, address.clone(), stop.clone(), length))
+        .map(|(i, address, stop, length)| {
+            thread::spawn(move || {
+                let mut count = 0;
+                let mut out_buf: Vec<u8> = vec![0; length];
+                out_buf[length - 1] = b'\n';
+                let mut in_buf: Vec<u8> = vec![0; length];
+                let mut stream = TcpStream::connect(address).unwrap();
 
-        thread::spawn(move || {
-            let mut sum = Count { inb: 0, outb: 0 };
-            let mut out_buf: Vec<u8> = vec![0; length];
-            out_buf[length - 1] = b'\n';
-            let mut in_buf: Vec<u8> = vec![0; length];
-            let mut stream = TcpStream::connect(&*address).unwrap();
-
-            loop {
-                if (*stop).load(Ordering::Relaxed) {
-                    break;
-                }
-
-                match stream.write_all(&out_buf) {
-                    Err(_) => {
-                        println!("Write error!");
-                        break;
+                while !stop.load(Ordering::Relaxed) {
+                    if let Err(e) = stream.write_all(&out_buf) {
+                        println!("thread {i} write error: {e}");
+                        return (count, 1);
                     }
-                    Ok(_) => sum.outb += 1,
-                }
 
-                if (*stop).load(Ordering::Relaxed) {
-                    break;
+                    if let Err(e) = stream.read_exact(&mut in_buf) {
+                        println!("thread {i} read error: {e}");
+                        return (count, 1);
+                    };
+                    count += 1;
                 }
-
-                match stream.read(&mut in_buf) {
-                    Err(_) => break,
-                    Ok(m) => {
-                        if m == 0 || m != length {
-                            println!("Read error! length={}", m);
-                            break;
-                        }
-                    }
-                };
-                sum.inb += 1;
-            }
-            tx.send(sum).unwrap();
-        });
-    }
+                (count, 0)
+            })
+        })
+        .collect();
 
     thread::sleep(Duration::from_secs(duration));
 
-    match control.upgrade() {
-        Some(stop) => (*stop).store(true, Ordering::Relaxed),
-        None => println!("Sorry, but all threads died already."),
-    }
+    control.upgrade().unwrap().store(true, Ordering::Relaxed);
 
-    let mut sum = Count { inb: 0, outb: 0 };
-    for _ in 0..number {
-        let c: Count = rx.recv().unwrap();
-        sum.inb += c.inb;
-        sum.outb += c.outb;
-    }
-    println!("Benchmarking: {}", address);
+    let (n_req, n_error) = group
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .reduce(|(a, b), (c, d)| (a + c, b + d))
+        .unwrap();
+
     println!(
-        "{} clients, running {} bytes, {} sec.",
-        number, length, duration
+        "Benchmarking: {address}
+{number} clients, running {length} bytes, {duration} sec.
+
+Error: {n_error}
+Speed: {} request/sec",
+        n_req / duration
     );
-    println!();
-    println!(
-        "Speed: {} request/sec, {} response/sec",
-        sum.outb / duration,
-        sum.inb / duration
-    );
-    println!("Requests: {}", sum.outb);
-    println!("Responses: {}", sum.inb);
 }
